@@ -205,20 +205,21 @@ export async function apply(ctx: Context, config, session) {
         altOriginalText = "\n" + tpTweet.altTexts.map((alt, i) => `[图片${tpTweet.altTexts.length > 1 ? (i + 1) : ""}描述原文: ${alt}]`).join("\n");
       }
       // 根据config决定是否翻译推文
-      let tweetWord;
+      let tweetWord = tweetText;
       if (config.whe_translate === true && config.apiKey) {
         try {
           const translation_result = await translate(tweetText, ctx, config);
           if (config.outputLogs) {
             logger.info("手动查询翻译结果：", translation_result);
           }
-          tweetWord = translation_result;
+          if (typeof translation_result === 'string' && translation_result.trim()) {
+            tweetWord = translation_result;
+          } else if (config.outputLogs) {
+            logger.warn("手动翻译返回空或非字符串，回退原文", { type: typeof translation_result });
+          }
         } catch (err) {
           logger.error("手动翻译失败，返回原文：", err);
-          tweetWord = tweetText;
         }
-      } else {
-        tweetWord = tweetText;
       }
       // 根据是否为视频推文构造不同的消息结构
       if (isVideo) {
@@ -240,7 +241,11 @@ export async function apply(ctx: Context, config, session) {
                     'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
                   }
                 });
-                return h.image(response, 'image/jpeg');
+                const img = h.image(response, 'image/jpeg');
+                if (!img && config.outputLogs) {
+                  logger.warn("图片转码结果为空，image_url:", imageUrl);
+                }
+                return img;
               } catch (error) {
                 attempts++;
                 logger.error(`请求图片失败，正在尝试第 ${attempts} 次重试: ${imageUrl}`, error);
@@ -251,7 +256,7 @@ export async function apply(ctx: Context, config, session) {
               }
             }
           });
-          images = (await Promise.all(imagePromises)).filter((img) => img !== null);
+          images = (await Promise.all(imagePromises)).filter(Boolean);
           textMsg += `${images.join('\n')}`;
         }
         // 只发送第一个 mp4 视频
@@ -301,7 +306,11 @@ export async function apply(ctx: Context, config, session) {
                     'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
                   }
                 });
-                return h.image(response, 'image/jpeg');
+                const img = h.image(response, 'image/jpeg');
+                if (!img && config.outputLogs) {
+                  logger.warn("图片转码结果为空，image_url:", imageUrl);
+                }
+                return img;
               } catch (error) {
                 attempts++;
                 logger.error(`请求图片失败，正在尝试第 ${attempts} 次重试: ${imageUrl}`, error);
@@ -312,7 +321,7 @@ export async function apply(ctx: Context, config, session) {
               }
             }
           });
-          const images = (await Promise.all(imagePromises)).filter((img) => img !== null);
+          const images = (await Promise.all(imagePromises)).filter(Boolean);
           msg += `${images.join('\n')}`;
         }
         await sessionParam.send(msg);
@@ -790,13 +799,15 @@ async function checkTweets(session, config, ctx) { // 更新一次推文
           // 判断是否为视频推文：如果 mediaUrls 中包含 .mp4 则为 true
           const isVideo = mediaUrls.some(url => url.endsWith('.mp4'));
           // 根据config决定是否翻译推文
-          let tweetWord;
+          let tweetWord = tweetText;
           if (config.whe_translate === true && config.apiKey) {
             const translation = await translate(tweetText, ctx, config);
             console.log('翻译结果', translation);
-            tweetWord = translation;
-          } else {
-            tweetWord = tweetText;
+            if (typeof translation === 'string' && translation.trim()) {
+              tweetWord = translation;
+            } else if (config.outputLogs) {
+              logger.warn("翻译返回空或非字符串，回退原文", { type: typeof translation });
+            }
           }
 
           // 判断是否命中违禁词
@@ -844,7 +855,11 @@ async function checkTweets(session, config, ctx) { // 更新一次推文
                         'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
                       }
                     });
-                    return h.image(response, 'image/jpeg');
+                    const img = h.image(response, 'image/jpeg');
+                    if (!img && config.outputLogs) {
+                      logger.warn("图片转码结果为空，image_url:", imageUrl);
+                    }
+                    return img;
                   } catch (error) {
                     attempts++;
                     logger.error(`请求图片失败，正在尝试第 ${attempts} 次重试: ${imageUrl}`, error);
@@ -855,7 +870,7 @@ async function checkTweets(session, config, ctx) { // 更新一次推文
                   }
                 }
               });
-              images = (await Promise.all(imagePromises)).filter((img) => img !== null);
+              images = (await Promise.all(imagePromises)).filter(Boolean);
               textMsg += `${images.join('\n')}`;
             }
             // 单独发送mp4视频
@@ -911,7 +926,11 @@ async function checkTweets(session, config, ctx) { // 更新一次推文
                         'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
                       }
                     });
-                    return h.image(response, 'image/jpeg');
+                    const img = h.image(response, 'image/jpeg');
+                    if (!img && config.outputLogs) {
+                      logger.warn("图片转码结果为空，image_url:", imageUrl);
+                    }
+                    return img;
                   } catch (error) {
                     attempts++;
                     logger.error(`请求图片失败，正在尝试第 ${attempts} 次重试: ${imageUrl}`, error);
@@ -922,7 +941,7 @@ async function checkTweets(session, config, ctx) { // 更新一次推文
                   }
                 }
               });
-              const images = (await Promise.all(imagePromises)).filter((img) => img !== null);
+              const images = (await Promise.all(imagePromises)).filter(Boolean);
               msg += `${images.join('\n')}`;
             }
             for (const groupId of groupID) {
@@ -1030,8 +1049,15 @@ async function translate(text: string, ctx, config) { // 翻译推文
       if (config.outputLogs) {
         logger.info('翻译api返回结果：', response);
       }
-      console.log('翻译结果：', response.choices[0].message.content);
-      const translation = response.choices[0].message.content;
+      const translation = response?.choices?.[0]?.message?.content;
+      if (typeof translation !== 'string') {
+        logger.error('翻译接口返回结构异常，无法读取 content', {
+          hasChoices: !!response?.choices,
+          firstChoiceKeys: response?.choices?.[0] ? Object.keys(response.choices[0]) : [],
+        });
+        return '';
+      }
+      console.log('翻译结果：', translation);
       return translation;
     } catch (err) {
       attempts++;
