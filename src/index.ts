@@ -668,7 +668,10 @@ function formatImageTranslatedSections(imageTranslated: string): string[] {
     return ['[图片译文]', blocks[0].content];
   }
   const lines: string[] = [];
-  for (const block of blocks) {
+  for (const [position, block] of blocks.entries()) {
+    if (position > 0) {
+      lines.push('');
+    }
     lines.push(`[图片${block.index}译文]`);
     lines.push(block.content);
   }
