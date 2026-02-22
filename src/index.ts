@@ -247,11 +247,13 @@ export async function apply(ctx: Context, config, session) {
       const tweetText = tpTweet.word_content ?? '';
       const mediaUrls = tpTweet.mediaUrls || [];
       const altTexts = tpTweet.altTexts || [];
+      const mediaBufferCache = new Map<string, Buffer>();
       const isVideo = mediaUrls.some((u) => u.endsWith(".mp4"));
       const translationBundle = await buildTweetTranslationBundle({
         textOriginal: tweetText,
         altOriginalList: altTexts,
         mediaUrls,
+        mediaBufferCache,
         ctx,
         config,
       });
@@ -271,7 +273,7 @@ export async function apply(ctx: Context, config, session) {
         // 只收集图片
         const imageUrls = mediaUrls.filter((u) => !u.endsWith('.mp4'));
         if (imageUrls.length > 0) {
-          const images = await buildImageElementsFromUrls(ctx, imageUrls, config);
+          const images = await buildImageElementsFromUrls(ctx, imageUrls, config, mediaBufferCache);
           textMsg += `${images.join('\n')}`;
         }
         // 只发送第一个 mp4 视频
@@ -300,7 +302,7 @@ export async function apply(ctx: Context, config, session) {
         msg += "\n";
         msg += `${h.image(tpTweet.screenshotBuffer, "image/webp")}\n`;
         if (mediaUrls.length > 0) {
-          const images = await buildImageElementsFromUrls(ctx, mediaUrls, config);
+          const images = await buildImageElementsFromUrls(ctx, mediaUrls, config, mediaBufferCache);
           msg += `${images.join('\n')}`;
         }
         await sessionParam.send(msg);
@@ -367,6 +369,7 @@ export async function apply(ctx: Context, config, session) {
       if (!config || config.detectXLinks === false) return next();
       const text = session2.content || '';
       if (!text) return next();
+      if (isManualTwitterCommandMessage(text)) return next();
       const candidates = extractUrls(text);
       if (!candidates.length) return next();
       const found: string[] = [];
@@ -379,10 +382,11 @@ export async function apply(ctx: Context, config, session) {
           found.push(normalized);
         }
       }
-      if (found.length) {
-        logger.info('检测到 X/Twitter 链接:', found);
+      const uniqueFound = Array.from(new Set(found));
+      if (uniqueFound.length) {
+        logger.info('检测到 X/Twitter 链接:', uniqueFound);
         // 对检测到的链接执行与命令相同的处理流程
-        for (const link of found) {
+        for (const link of uniqueFound) {
           try {
             await processTwitterUrl(session2, link);
           } catch (e) {
@@ -408,6 +412,7 @@ interface BuildTranslationBundleParams {
   textOriginal: string;
   altOriginalList: string[];
   mediaUrls: string[];
+  mediaBufferCache?: Map<string, Buffer>;
   ctx: Context;
   config: Config;
 }
@@ -446,6 +451,12 @@ function isBilingualOutput(config: Config): boolean {
 
 function sleep(ms: number) {
   return new Promise(resolve => setTimeout(resolve, ms));
+}
+
+function isManualTwitterCommandMessage(content: string): boolean {
+  const trimmed = toNonEmptyString(content);
+  if (!trimmed) return false;
+  return /^\/?twitter(?:\s|$)/i.test(trimmed);
 }
 
 function toNonEmptyString(input: any): string {
@@ -511,6 +522,21 @@ function isNoTextImageMarker(value: string): boolean {
   return /^(?:无可识别文字|无可识别文本|无文字|无文本|none|n\/a|na|空|（无可识别文字）)$/.test(normalized.toLowerCase());
 }
 
+function isNoTextImageResponse(value: string): boolean {
+  const source = toNonEmptyString(value);
+  if (!source) return true;
+  const lines = source
+    .split('\n')
+    .map(line => line.trim())
+    .filter(Boolean)
+    .map(line => line.replace(/^[\-\*\d\.\)\(【\[\]：:\s]+/, '').trim());
+  if (!lines.length) return true;
+  return lines.every(line => {
+    if (isNoTextImageMarker(line)) return true;
+    return /无可识别文字|无可识别文本|无文字|no\s*text|no\s*readable\s*text/i.test(line);
+  });
+}
+
 function parseImageTranslationResult(text: string): ImageTranslationResult {
   const source = toNonEmptyString(text);
   if (!source) return { translated: '', original: '', raw: '' };
@@ -541,8 +567,15 @@ function parseImageTranslationResult(text: string): ImageTranslationResult {
   }
 
   if (!rows.size) {
+    if (isNoTextImageResponse(source)) {
+      return {
+        translated: '',
+        original: '',
+        raw: source,
+      };
+    }
     return {
-      translated: '',
+      translated: source,
       original: '',
       raw: source,
     };
@@ -685,7 +718,21 @@ async function translateText(text: string, ctx: Context, config: Config, scene =
   return callLLM([{ role: 'user', content: prompt }], ctx, config, scene);
 }
 
-async function fetchBinaryWithRetry(ctx: Context, mediaUrl: string, config: Config, maxRetries = 3, mediaKind = '图片'): Promise<Buffer | null> {
+async function fetchBinaryWithRetry(
+  ctx: Context,
+  mediaUrl: string,
+  config: Config,
+  maxRetries = 3,
+  mediaKind = '图片',
+  mediaBufferCache?: Map<string, Buffer>
+): Promise<Buffer | null> {
+  if (mediaBufferCache?.has(mediaUrl)) {
+    const cached = mediaBufferCache.get(mediaUrl) || null;
+    if (cached && config.outputLogs) {
+      logger.info(`[${mediaKind}] 命中缓存`, { mediaUrl, bytes: cached.length });
+    }
+    if (cached) return cached;
+  }
   let attempts = 0;
   while (attempts < Math.max(1, maxRetries)) {
     try {
@@ -696,6 +743,9 @@ async function fetchBinaryWithRetry(ctx: Context, mediaUrl: string, config: Conf
         }
       });
       const buffer = Buffer.isBuffer(response) ? response : Buffer.from(response);
+      if (mediaBufferCache) {
+        mediaBufferCache.set(mediaUrl, buffer);
+      }
       if (config.outputLogs) {
         logger.info(`[${mediaKind}] 下载成功`, { mediaUrl, bytes: buffer.length });
       }
@@ -713,11 +763,16 @@ async function fetchBinaryWithRetry(ctx: Context, mediaUrl: string, config: Conf
   return null;
 }
 
-async function buildImageElementsFromUrls(ctx: Context, urls: string[], config: Config): Promise<any[]> {
+async function buildImageElementsFromUrls(
+  ctx: Context,
+  urls: string[],
+  config: Config,
+  mediaBufferCache?: Map<string, Buffer>
+): Promise<any[]> {
   const imagePromises = urls.map(async (imageUrl) => {
-    const buffer = await fetchBinaryWithRetry(ctx, imageUrl, config, 3, '图片');
+    const buffer = await fetchBinaryWithRetry(ctx, imageUrl, config, 3, '图片', mediaBufferCache);
     if (!buffer) return null;
-    const img = h.image(buffer, 'image/jpeg');
+    const img = h.image(buffer, detectImageMime(buffer));
     if (!img && config.outputLogs) {
       logger.warn("图片转码结果为空，image_url:", imageUrl);
     }
@@ -828,17 +883,25 @@ async function compressImageToLimit(pptr: any, inputBuffer: Buffer, maxBytes: nu
   }
 }
 
-async function prepareImagesForLLM(ctx: Context, imageUrls: string[], config: Config): Promise<PreparedImageForLLM[]> {
+async function prepareImagesForLLM(
+  ctx: Context,
+  imageUrls: string[],
+  config: Config,
+  mediaBufferCache?: Map<string, Buffer>
+): Promise<PreparedImageForLLM[]> {
   const maxBytes = Math.max(64, config.llmImageInputSizeLimitKB ?? 1024) * 1024;
-  const prepared: PreparedImageForLLM[] = [];
-  for (let i = 0; i < imageUrls.length; i++) {
+  const results: Array<PreparedImageForLLM | null> = new Array(imageUrls.length).fill(null);
+  let cursor = 0;
+  const workerCount = Math.min(3, Math.max(1, imageUrls.length));
+
+  const processOne = async (i: number): Promise<PreparedImageForLLM | null> => {
     const imageUrl = imageUrls[i];
-    const original = await fetchBinaryWithRetry(ctx, imageUrl, config, 3, 'LLM输入图片');
+    const original = await fetchBinaryWithRetry(ctx, imageUrl, config, 3, 'LLM输入图片', mediaBufferCache);
     if (!original) {
       if (config.outputLogs) {
         logger.warn(`[LLM输入图片] 图片${i + 1} 下载失败，已跳过`, { imageUrl });
       }
-      continue;
+      return null;
     }
 
     let finalBuffer = original;
@@ -852,7 +915,7 @@ async function prepareImagesForLLM(ctx: Context, imageUrls: string[], config: Co
             maxBytes,
           });
         }
-        continue;
+        return null;
       }
       finalBuffer = compressed;
     }
@@ -865,33 +928,51 @@ async function prepareImagesForLLM(ctx: Context, imageUrls: string[], config: Co
           maxBytes,
         });
       }
-      continue;
+      return null;
     }
 
     const mime = detectImageMime(finalBuffer);
-    prepared.push({
+    return {
       index: i + 1,
       sourceUrl: imageUrl,
       originalBytes: original.length,
       finalBytes: finalBuffer.length,
       dataUrl: `data:${mime};base64,${finalBuffer.toString('base64')}`,
-    });
-  }
+    };
+  };
+
+  const worker = async () => {
+    while (true) {
+      const i = cursor++;
+      if (i >= imageUrls.length) break;
+      results[i] = await processOne(i);
+    }
+  };
+
+  await Promise.all(Array.from({ length: workerCount }, () => worker()));
+  const prepared = results.filter(item => !!item) as PreparedImageForLLM[];
   if (config.outputLogs) {
     logger.info('[LLM输入图片] 预处理完成', {
       requestedCount: imageUrls.length,
       preparedCount: prepared.length,
       maxBytes,
+      workerCount,
     });
   }
   return prepared;
 }
 
-async function translateImagesInBatches(textOriginal: string, imageUrls: string[], ctx: Context, config: Config): Promise<ImageTranslationResult> {
+async function translateImagesInBatches(
+  textOriginal: string,
+  imageUrls: string[],
+  ctx: Context,
+  config: Config,
+  mediaBufferCache?: Map<string, Buffer>
+): Promise<ImageTranslationResult> {
   if (!isTranslateEnabled(config) || !config.llmImageInputEnabled) return { translated: '', original: '', raw: '' };
   if (!imageUrls.length) return { translated: '', original: '', raw: '' };
 
-  const prepared = await prepareImagesForLLM(ctx, imageUrls, config);
+  const prepared = await prepareImagesForLLM(ctx, imageUrls, config, mediaBufferCache);
   if (!prepared.length) return { translated: '', original: '', raw: '' };
 
   const batchLimit = Math.max(1, config.llmImageInputLimit ?? 2);
@@ -937,7 +1018,7 @@ async function translateImagesInBatches(textOriginal: string, imageUrls: string[
 }
 
 async function buildTweetTranslationBundle(params: BuildTranslationBundleParams): Promise<TweetTranslationBundle> {
-  const { textOriginal, altOriginalList, mediaUrls, ctx, config } = params;
+  const { textOriginal, altOriginalList, mediaUrls, mediaBufferCache, ctx, config } = params;
   const text = toNonEmptyString(textOriginal);
   const normalizedAlt = (altOriginalList || []).map(item => toNonEmptyString(item)).filter(Boolean);
   const imageUrls = extractOriginalTweetImageUrlsForLLM(mediaUrls || [], config);
@@ -971,7 +1052,7 @@ async function buildTweetTranslationBundle(params: BuildTranslationBundleParams)
   }
 
   if (config.llmImageInputEnabled && imageUrls.length > 0) {
-    const imageResult = await translateImagesInBatches(text, imageUrls, ctx, config);
+    const imageResult = await translateImagesInBatches(text, imageUrls, ctx, config, mediaBufferCache);
     bundle.imageTranslated = imageResult.translated;
     bundle.imageOriginal = imageResult.original;
   } else if (config.outputLogs && imageUrls.length > 0) {
@@ -1409,6 +1490,7 @@ async function checkTweets(session, config, ctx) { // 更新一次推文
           const tweetText = tpTweet.word_content ?? '';
           const mediaUrls = tpTweet.mediaUrls || [];
           const altTexts = tpTweet.altTexts || [];
+          const mediaBufferCache = new Map<string, Buffer>();
           await ctx.database.upsert('xanalyse', [
             { id, link: latestTweetLink, content: latestTweetcontent },
           ]);
@@ -1423,6 +1505,7 @@ async function checkTweets(session, config, ctx) { // 更新一次推文
             textOriginal: tweetText,
             altOriginalList: altTexts,
             mediaUrls,
+            mediaBufferCache,
             ctx,
             config,
           });
@@ -1467,7 +1550,7 @@ async function checkTweets(session, config, ctx) { // 更新一次推文
             // 收集图片
             const imageUrls = mediaUrls.filter(url => !url.endsWith('.mp4'));
             if (imageUrls.length > 0) {
-              const images = await buildImageElementsFromUrls(ctx, imageUrls, config);
+              const images = await buildImageElementsFromUrls(ctx, imageUrls, config, mediaBufferCache);
               textMsg += `${images.join('\n')}`;
             }
             // 单独发送mp4视频
@@ -1500,7 +1583,7 @@ async function checkTweets(session, config, ctx) { // 更新一次推文
             msg += "\n";
             msg += `${h.image(tpTweet.screenshotBuffer, "image/webp")}\n`;
             if (mediaUrls.length > 0) {
-              const images = await buildImageElementsFromUrls(ctx, mediaUrls, config);
+              const images = await buildImageElementsFromUrls(ctx, mediaUrls, config, mediaBufferCache);
               msg += `${images.join('\n')}`;
             }
             for (const groupId of groupID) {
