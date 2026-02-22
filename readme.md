@@ -8,7 +8,7 @@
 <p>数据来源于 <a href="https://x.com" target="_blank">x.com</a></p>
 <hr>
 <h2>Tutorials</h2>
-<h3> ⭐️推文翻译功能需要前往<a href="https://platform.deepseek.com/usage" target="_blank">deepseek开放平台</a>申请API Keys并充值⭐️</h3>
+<h3> ⭐️推文翻译功能需要配置可用的 API Key，并确保对应服务账户可正常调用⭐️</h3>
 <h4>指令介绍：</h4>
 <p><b>twitter</b></p>
 <ul>
@@ -44,6 +44,11 @@
 <ul>
 <li>新增抓取失败重试次数配置（fetchRetries）</li>
 <li>新增翻译接口重试次数配置（translateRetries）</li>
+<li>新增 LLM 图片输入翻译链路（可选启用）</li>
+<li>新增配置项：llmImageInputEnabled、llmImageInputLimit、llmImageInputSizeLimitKB</li>
+<li>新增配置项：translationBilingual（双语/仅译文显示开关）</li>
+<li>图片超限时自动压缩，超出数量时分批翻译并保留批次上下文</li>
+<li>图片无文字时不再输出空图片翻译字段</li>
 <li>X/Twitter 链接检测功能移出实验性配置</li>
 <li>优化翻译提示词默认预设（不覆盖用户自定义 prompt）</li>
 </ul>
