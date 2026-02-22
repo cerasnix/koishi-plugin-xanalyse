@@ -39,6 +39,18 @@
 <hr>
 <div class="version">
 <h3>Version</h3>
+<p>1.4.1</p>
+<p><b>功能更新</b></p>
+<ul>
+<li>新增配置项：<code>screenshotExtraWaitMs</code>（截图前额外等待时间，毫秒）</li>
+<li>优化图片译文展示：多图场景下每个图片译文块之间增加空行</li>
+</ul>
+<p><b>修复说明</b></p>
+<ul>
+<li>修复图片无文字时，图片译文可能误复用正文译文的问题</li>
+<li>修复图片译文字段解析兼容性问题（支持 <code>图片译文</code> / <code>图片1译文</code> / <code>[图片译文]</code> / <code>[图片1译文]</code> 等格式）</li>
+<li>修复无有效图片译文时仍可能出现图片译文空段落的问题</li>
+</ul>
 <p>1.4.0</p>
 <p><b>功能更新</b></p>
 <ul>
