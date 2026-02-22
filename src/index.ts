@@ -105,6 +105,7 @@ export interface Config {
   cookies: string;
   messagePrefix: string;
   fetchRetries: number;
+  screenshotExtraWaitMs?: number;
   whe_translate?: boolean;
   apiKey?: string;
   apiurl?: string;
@@ -131,7 +132,8 @@ export const Config = Schema.intersect([
     updateInterval: Schema.number().min(1).default(5).description('检查推文更新间隔时间（单位分钟），建议每多两个订阅增加1分钟'),
     cookies: Schema.string().required().description('x的登录cookies，获取方式往上翻看简介'),
     messagePrefix: Schema.string().default('获取了').description('推文消息前缀，例如"获取了"、"发布了"等'),
-    fetchRetries: Schema.number().min(1).default(3).description('抓取推文失败时的重试次数')
+    fetchRetries: Schema.number().min(1).default(3).description('抓取推文失败时的重试次数'),
+    screenshotExtraWaitMs: Schema.number().min(0).max(15000).default(1200).description('截图前额外等待时间（毫秒）：在页面就绪后再等待一段时间，降低图片未加载完整的概率')
   }).description('基础设置'),
 
   Schema.object({
@@ -453,6 +455,21 @@ function sleep(ms: number) {
   return new Promise(resolve => setTimeout(resolve, ms));
 }
 
+function getScreenshotExtraWaitMs(config: Config): number {
+  const raw = Number(config?.screenshotExtraWaitMs ?? 1200);
+  if (!Number.isFinite(raw) || raw <= 0) return 0;
+  return Math.floor(raw);
+}
+
+async function waitBeforeScreenshot(config: Config, scene: string) {
+  const extraWaitMs = getScreenshotExtraWaitMs(config);
+  if (extraWaitMs <= 0) return;
+  if (config.outputLogs) {
+    logger.info(`[截图等待] ${scene}，额外等待 ${extraWaitMs}ms`);
+  }
+  await sleep(extraWaitMs);
+}
+
 function isManualTwitterCommandMessage(content: string): boolean {
   const trimmed = toNonEmptyString(content);
   if (!trimmed) return false;
@@ -564,6 +581,51 @@ function isNoTextImageResponse(value: string): boolean {
   });
 }
 
+function parseImageFieldLine(rawLine: string): { index: number; field: 'translated' | 'original'; value: string } | null {
+  const line = toNonEmptyString(rawLine)
+    .replace(/^[\-\*\u2022]+\s*/, '')
+    .trim();
+  if (!line) return null;
+
+  const indexedColon = line.match(/^图片\s*(\d+)\s*(译文|原文)\s*(?:[:：]\s*(.*))?$/);
+  if (indexedColon) {
+    return {
+      index: Number(indexedColon[1]),
+      field: indexedColon[2] === '译文' ? 'translated' : 'original',
+      value: (indexedColon[3] || '').trim(),
+    };
+  }
+
+  const indexedBracket = line.match(/^[\[\【]\s*图片\s*(\d+)\s*(译文|原文)\s*[\]\】]\s*(?:[:：]\s*(.*))?$/);
+  if (indexedBracket) {
+    return {
+      index: Number(indexedBracket[1]),
+      field: indexedBracket[2] === '译文' ? 'translated' : 'original',
+      value: (indexedBracket[3] || '').trim(),
+    };
+  }
+
+  const singleColon = line.match(/^图片\s*(译文|原文)\s*(?:[:：]\s*(.*))?$/);
+  if (singleColon) {
+    return {
+      index: 1,
+      field: singleColon[1] === '译文' ? 'translated' : 'original',
+      value: (singleColon[2] || '').trim(),
+    };
+  }
+
+  const singleBracket = line.match(/^[\[\【]\s*图片\s*(译文|原文)\s*[\]\】]\s*(?:[:：]\s*(.*))?$/);
+  if (singleBracket) {
+    return {
+      index: 1,
+      field: singleBracket[1] === '译文' ? 'translated' : 'original',
+      value: (singleBracket[2] || '').trim(),
+    };
+  }
+
+  return null;
+}
+
 function parseImageTranslationResult(text: string): ImageTranslationResult {
   const source = toNonEmptyString(text);
   if (!source) return { translated: '', original: '', raw: '' };
@@ -575,11 +637,9 @@ function parseImageTranslationResult(text: string): ImageTranslationResult {
     const line = rawLine.trim();
     if (!line) continue;
     if (/^第\s*\d+\s*批/.test(line)) continue;
-    const matched = line.match(/^图片\s*(\d+)\s*(译文|原文)\s*[:：]\s*(.*)$/);
-    if (matched) {
-      const index = Number(matched[1]);
-      const field = matched[2] === '译文' ? 'translated' : 'original';
-      const value = matched[3] || '';
+    const parsedField = parseImageFieldLine(line);
+    if (parsedField) {
+      const { index, field, value } = parsedField;
       const prev = rows.get(index) || {};
       prev[field] = value;
       rows.set(index, prev);
@@ -633,17 +693,19 @@ function parseIndexedImageFieldBlocks(text: string, fieldLabel: '译文' | '原�
   const lines = source.split('\n');
   const rows = new Map<number, string>();
   let lastIndex: number | null = null;
-  const matcher = new RegExp(`^图片\\s*(\\d+)\\s*${fieldLabel}\\s*[:：]\\s*(.*)$`);
+  const targetField = fieldLabel === '译文' ? 'translated' : 'original';
 
   for (const rawLine of lines) {
     const line = rawLine.trim();
     if (!line) continue;
-    const matched = line.match(matcher);
-    if (matched) {
-      const index = Number(matched[1]);
-      const value = (matched[2] || '').trim();
-      rows.set(index, value);
-      lastIndex = index;
+    const parsedField = parseImageFieldLine(line);
+    if (parsedField) {
+      if (parsedField.field === targetField) {
+        rows.set(parsedField.index, parsedField.value);
+        lastIndex = parsedField.index;
+      } else {
+        lastIndex = null;
+      }
       continue;
     }
     if (lastIndex !== null) {
@@ -652,7 +714,7 @@ function parseIndexedImageFieldBlocks(text: string, fieldLabel: '译文' | '原�
   }
 
   if (!rows.size) {
-    return [{ index: 1, content: source }];
+    return [];
   }
 
   return Array.from(rows.entries())
@@ -1123,9 +1185,10 @@ function buildTweetIntroMessage(params: BuildIntroMessageParams): string {
     lines.push(bundle.textOriginal || '（无正文）');
   }
 
-  if (bundle.imageTranslated) {
+  const imageTranslatedSections = formatImageTranslatedSections(bundle.imageTranslated);
+  if (imageTranslatedSections.length > 0) {
     lines.push('');
-    lines.push(...formatImageTranslatedSections(bundle.imageTranslated));
+    lines.push(...imageTranslatedSections);
   }
   if (bilingualOutput && bundle.imageOriginal) {
     lines.push('[图片原文]');
@@ -1205,6 +1268,7 @@ async function getTimePushedTweet(ctx, pptr, url, config, maxRetries?: number): 
         } catch (__) {
           // proceed even if timeout — we'll still try to capture
         }
+        await waitBeforeScreenshot(config, '公开推文截图');
         const box = await element.boundingBox();
         if (box) {
           // detect a likely avatar inside the article by finding a small image near the top
@@ -1267,6 +1331,7 @@ async function getTimePushedTweet(ctx, pptr, url, config, maxRetries?: number): 
               }, { timeout: 8000 }, 'article[data-testid="tweet"]');
             } catch (__) {
             }
+            await waitBeforeScreenshot(config, '受保护推文截图');
             const box2 = await element2.boundingBox();
             if (box2) {
               const imgs2 = await element2.$$('img');
