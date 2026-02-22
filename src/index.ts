@@ -463,6 +463,33 @@ function toNonEmptyString(input: any): string {
   return typeof input === 'string' ? input.trim() : '';
 }
 
+function isTcoUrlToken(token: string): boolean {
+  const cleaned = token
+    .replace(/^[\(\[【<"'`]+/, '')
+    .replace(/[\)\]】>"'`,.;:!?，。？！、]+$/g, '');
+  if (!/^https?:\/\//i.test(cleaned)) return false;
+  try {
+    const u = new URL(cleaned);
+    return (u.hostname || '').toLowerCase() === 't.co';
+  } catch {
+    return false;
+  }
+}
+
+function normalizeTweetTextFromApi(rawText: string, mediaCount: number, outputLogs?: boolean): string {
+  const text = toNonEmptyString(rawText);
+  if (!text) return '';
+  if (mediaCount <= 0) return text;
+  const tokens = text.split(/\s+/).map(t => t.trim()).filter(Boolean);
+  if (!tokens.length) return '';
+  const placeholderOnly = tokens.every(isTcoUrlToken);
+  if (!placeholderOnly) return text;
+  if (outputLogs) {
+    logger.info('[正文清洗] 检测到仅含 t.co 媒体占位链接，已清空正文', { mediaCount, text });
+  }
+  return '';
+}
+
 function getPromptTemplate(config: Config): string {
   return (config.prompt && config.prompt.trim()) ? config.prompt : DEFAULT_PROMPT;
 }
@@ -1309,10 +1336,16 @@ async function getTimePushedTweet(ctx, pptr, url, config, maxRetries?: number): 
                 .filter((m) => m.altText && m.altText.trim())
                 .map((m) => m.altText.trim());
             }
+            const mediaUrls = apiResponse.media_extended ? apiResponse.media_extended.map(m => m.url) : [];
+            const normalizedWordContent = normalizeTweetTextFromApi(
+              apiResponse.text || "",
+              mediaUrls.length,
+              config.outputLogs
+            );
             return {
-              word_content: apiResponse.text || "",
+              word_content: normalizedWordContent,
               altTexts: altTexts,  // 保留原始ALT文本用于显示原文
-              mediaUrls: apiResponse.media_extended ? apiResponse.media_extended.map(m => m.url) : [],
+              mediaUrls: mediaUrls,
               screenshotBuffer
             };
           } catch (err) {
