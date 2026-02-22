@@ -567,6 +567,54 @@ function parseImageTranslationResult(text: string): ImageTranslationResult {
   };
 }
 
+function parseIndexedImageFieldBlocks(text: string, fieldLabel: '译文' | '原文'): Array<{ index: number; content: string }> {
+  const source = toNonEmptyString(text);
+  if (!source) return [];
+  const lines = source.split('\n');
+  const rows = new Map<number, string>();
+  let lastIndex: number | null = null;
+  const matcher = new RegExp(`^图片\\s*(\\d+)\\s*${fieldLabel}\\s*[:：]\\s*(.*)$`);
+
+  for (const rawLine of lines) {
+    const line = rawLine.trim();
+    if (!line) continue;
+    const matched = line.match(matcher);
+    if (matched) {
+      const index = Number(matched[1]);
+      const value = (matched[2] || '').trim();
+      rows.set(index, value);
+      lastIndex = index;
+      continue;
+    }
+    if (lastIndex !== null) {
+      rows.set(lastIndex, `${rows.get(lastIndex) || ''}\n${line}`.trim());
+    }
+  }
+
+  if (!rows.size) {
+    return [{ index: 1, content: source }];
+  }
+
+  return Array.from(rows.entries())
+    .sort((a, b) => a[0] - b[0])
+    .map(([index, content]) => ({ index, content: toNonEmptyString(content) }))
+    .filter(item => !!item.content);
+}
+
+function formatImageTranslatedSections(imageTranslated: string): string[] {
+  const blocks = parseIndexedImageFieldBlocks(imageTranslated, '译文');
+  if (!blocks.length) return [];
+  if (blocks.length === 1) {
+    return ['[图片译文]', blocks[0].content];
+  }
+  const lines: string[] = [];
+  for (const block of blocks) {
+    lines.push(`[图片${block.index}译文]`);
+    lines.push(block.content);
+  }
+  return lines;
+}
+
 function summarizeMessages(messages: ChatMessage[]) {
   let imageCount = 0;
   for (const msg of messages) {
@@ -958,7 +1006,6 @@ function buildTweetIntroMessage(params: BuildIntroMessageParams): string {
     return lines.join('\n');
   }
 
-  lines.push('[文字译文]');
   lines.push(bundle.textTranslated || '（无正文）');
   if (bilingualOutput) {
     lines.push('[文字原文]');
@@ -966,8 +1013,8 @@ function buildTweetIntroMessage(params: BuildIntroMessageParams): string {
   }
 
   if (bundle.imageTranslated) {
-    lines.push('[图片译文]');
-    lines.push(bundle.imageTranslated);
+    lines.push('');
+    lines.push(...formatImageTranslatedSections(bundle.imageTranslated));
   }
   if (bilingualOutput && bundle.imageOriginal) {
     lines.push('[图片原文]');
