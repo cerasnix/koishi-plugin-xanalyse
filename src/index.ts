@@ -50,7 +50,7 @@ export const usage = `
 <hr>
 <div class="version">
 <h3>Version</h3>
-<p>1.3.0</p>
+<p>1.4.0</p>
 <ul>
 <li>新增 X/Twitter 链接自动检测功能，可识别并自动处理消息中的推文链接</li>
 <li>新增图片 ALT 文本提取功能，自动获取推文图片的描述文字</li>
