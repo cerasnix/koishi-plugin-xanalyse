@@ -42,6 +42,7 @@
 <p>1.4.2</p>
 <p><b>功能更新</b></p>
 <ul>
+<li>新增配置项：<code>screenshotHighQualityMode</code>（高质量模式，开启后截图使用 <code>deviceScaleFactor=2</code>）</li>
 <li>优化截图链路：固定截图 viewport（<code>1280x2200</code>，<code>deviceScaleFactor=1</code>），统一滚动定位与布局稳定检测流程</li>
 <li>优化截图抗干扰能力：截图前临时隐藏高风险 <code>fixed/sticky</code> 浮层并冻结动画，截图后自动恢复页面状态</li>
 <li>优化配置页说明：Version 区块精简为“更新记录请参考顶部插件主页”</li>
