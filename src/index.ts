@@ -86,7 +86,7 @@ const ALT_TRANSLATION_PROMPT_APPEND = [
 ].join('\n');
 const REQUEST_USER_AGENT = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36';
 const TWEET_ARTICLE_SELECTOR = 'article[data-testid="tweet"]';
-const STABLE_SCREENSHOT_VIEWPORT = { width: 1280, height: 2200, deviceScaleFactor: 1 };
+const BASE_SCREENSHOT_VIEWPORT = { width: 1280, height: 2200 };
 const SCREENSHOT_STABILITY_STYLE_ID = '__xanalyse_screenshot_stability_style__';
 const SCREENSHOT_OVERLAY_MARK_ATTR = 'data-xanalyse-hide-overlay';
 const SCREENSHOT_STABILITY_CSS = [
@@ -103,6 +103,7 @@ export interface Config {
   messagePrefix: string;
   fetchRetries: number;
   screenshotExtraWaitMs?: number;
+  screenshotHighQualityMode?: boolean;
   whe_translate?: boolean;
   apiKey?: string;
   apiurl?: string;
@@ -130,7 +131,8 @@ export const Config = Schema.intersect([
     cookies: Schema.string().required().description('x的登录cookies，获取方式往上翻看简介'),
     messagePrefix: Schema.string().default('获取了').description('推文消息前缀，例如"获取了"、"发布了"等'),
     fetchRetries: Schema.number().min(1).default(3).description('抓取推文失败时的重试次数'),
-    screenshotExtraWaitMs: Schema.number().min(0).max(15000).default(1200).description('截图前额外等待时间（毫秒）：在页面就绪后再等待一段时间，降低图片未加载完整的概率')
+    screenshotExtraWaitMs: Schema.number().min(0).max(15000).default(1200).description('截图前额外等待时间（毫秒）：在页面就绪后再等待一段时间，降低图片未加载完整的概率'),
+    screenshotHighQualityMode: Schema.boolean().default(false).description('高质量模式：开启后截图使用 deviceScaleFactor=2（更清晰但更耗时）')
   }).description('基础设置'),
 
   Schema.object({
@@ -467,10 +469,19 @@ async function waitBeforeScreenshot(config: Config, scene: string) {
   await sleep(extraWaitMs);
 }
 
+function getScreenshotViewport(config: Config) {
+  const deviceScaleFactor = config?.screenshotHighQualityMode ? 2 : 1;
+  return {
+    ...BASE_SCREENSHOT_VIEWPORT,
+    deviceScaleFactor,
+  };
+}
+
 async function applyStableScreenshotViewport(page: any, config: Config) {
-  await page.setViewport(STABLE_SCREENSHOT_VIEWPORT);
+  const viewport = getScreenshotViewport(config);
+  await page.setViewport(viewport);
   if (config.outputLogs) {
-    logger.info('[截图参数] 使用固定 viewport', STABLE_SCREENSHOT_VIEWPORT);
+    logger.info('[截图参数] 使用固定 viewport', viewport);
   }
 }
 
