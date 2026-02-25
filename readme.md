@@ -39,6 +39,19 @@
 <hr>
 <div class="version">
 <h3>Version</h3>
+<p>1.4.2</p>
+<p><b>功能更新</b></p>
+<ul>
+<li>优化截图链路：固定截图 viewport（<code>1280x2200</code>，<code>deviceScaleFactor=1</code>），统一滚动定位与布局稳定检测流程</li>
+<li>优化截图抗干扰能力：截图前临时隐藏高风险 <code>fixed/sticky</code> 浮层并冻结动画，截图后自动恢复页面状态</li>
+<li>优化配置页说明：Version 区块精简为“更新记录请参考顶部插件主页”</li>
+</ul>
+<p><b>修复说明</b></p>
+<ul>
+<li>修复推文截图偶发区域偏移、错位的问题</li>
+<li>修复推文截图偶发白色画面的问题</li>
+<li>缓解截图中偶发黑色圆点等浮层干扰问题</li>
+</ul>
 <p>1.4.1</p>
 <p><b>功能更新</b></p>
 <ul>
