@@ -50,19 +50,7 @@ export const usage = `
 <hr>
 <div class="version">
 <h3>Version</h3>
-<p>1.4.0</p>
-<ul>
-<li>新增 X/Twitter 链接自动检测功能，可识别并自动处理消息中的推文链接</li>
-<li>新增图片 ALT 文本提取功能，自动获取推文图片的描述文字</li>
-<li>新增可配置消息前缀选项 <code>messagePrefix</code></li>
-<li>优化推文截图逻辑，改进头像区域检测</li>
-<li>调整图片描述原文显示位置至推文正文之后</li>
-<li>手动查询命令现支持翻译功能</li>
-</ul>
-<p>1.2.0</p>
-<ul>
-<li>增加了违禁词识别功能</li>
-</ul>
+<p>版本更新记录请参考顶部“插件主页”。</p>
 </div>
 <hr>
 <h2>⚠！重要告示！⚠</h2>
@@ -97,6 +85,15 @@ const ALT_TRANSLATION_PROMPT_APPEND = [
   '3. 无法翻译时保留原文。'
 ].join('\n');
 const REQUEST_USER_AGENT = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36';
+const TWEET_ARTICLE_SELECTOR = 'article[data-testid="tweet"]';
+const STABLE_SCREENSHOT_VIEWPORT = { width: 1280, height: 2200, deviceScaleFactor: 1 };
+const SCREENSHOT_STABILITY_STYLE_ID = '__xanalyse_screenshot_stability_style__';
+const SCREENSHOT_OVERLAY_MARK_ATTR = 'data-xanalyse-hide-overlay';
+const SCREENSHOT_STABILITY_CSS = [
+  `[${SCREENSHOT_OVERLAY_MARK_ATTR}="1"] { visibility: hidden !important; opacity: 0 !important; pointer-events: none !important; }`,
+  '*, *::before, *::after { animation: none !important; transition: none !important; caret-color: transparent !important; }',
+  'html { scroll-behavior: auto !important; }',
+].join('\n');
 
 export interface Config {
   account: string;
@@ -468,6 +465,193 @@ async function waitBeforeScreenshot(config: Config, scene: string) {
     logger.info(`[截图等待] ${scene}，额外等待 ${extraWaitMs}ms`);
   }
   await sleep(extraWaitMs);
+}
+
+async function applyStableScreenshotViewport(page: any, config: Config) {
+  await page.setViewport(STABLE_SCREENSHOT_VIEWPORT);
+  if (config.outputLogs) {
+    logger.info('[截图参数] 使用固定 viewport', STABLE_SCREENSHOT_VIEWPORT);
+  }
+}
+
+async function waitForTweetImagesLoaded(page: any, selector: string) {
+  await page.waitForFunction((sel) => {
+    const root = document.querySelector(sel);
+    if (!root) return false;
+    const imgs = Array.from(root.querySelectorAll('img')) as HTMLImageElement[];
+    return imgs.every((img) => img.complete && img.naturalWidth > 0);
+  }, { timeout: 8000 }, selector);
+}
+
+async function waitForStableElementBox(element: any, samples = 6, intervalMs = 120) {
+  let lastBox: any = null;
+  let stableCount = 0;
+  for (let i = 0; i < samples; i++) {
+    const box = await element.boundingBox();
+    if (box && box.width > 40 && box.height > 40) {
+      if (
+        lastBox &&
+        Math.abs(box.x - lastBox.x) < 1 &&
+        Math.abs(box.y - lastBox.y) < 1 &&
+        Math.abs(box.width - lastBox.width) < 1 &&
+        Math.abs(box.height - lastBox.height) < 1
+      ) {
+        stableCount += 1;
+        if (stableCount >= 2) return box;
+      } else {
+        stableCount = 0;
+      }
+      lastBox = box;
+    }
+    await sleep(intervalMs);
+  }
+  return lastBox;
+}
+
+function clampClipToViewport(box: any, viewport: any, pad = 12) {
+  if (!box || !viewport) return null;
+  const left = Math.max(0, Math.floor(box.x - pad));
+  const top = Math.max(0, Math.floor(box.y - pad));
+  const right = Math.min(viewport.width, Math.ceil(box.x + box.width + pad));
+  const bottom = Math.min(viewport.height, Math.ceil(box.y + box.height + pad));
+  const width = right - left;
+  const height = bottom - top;
+  if (width <= 1 || height <= 1) return null;
+  return { x: left, y: top, width, height };
+}
+
+async function installScreenshotVisualGuards(page: any, config: Config): Promise<() => Promise<void>> {
+  try {
+    await page.evaluate((tweetSelector, styleId, markAttr, cssText) => {
+      const prevMarked = Array.from(document.querySelectorAll(`[${markAttr}]`));
+      for (const node of prevMarked) {
+        node.removeAttribute(markAttr);
+      }
+
+      const tweet = document.querySelector(tweetSelector);
+      const candidates = Array.from(document.querySelectorAll('body *'));
+      for (const node of candidates) {
+        if (!(node instanceof HTMLElement)) continue;
+        if (!node.isConnected) continue;
+        if (tweet && (node === tweet || node.contains(tweet) || tweet.contains(node))) continue;
+
+        const role = (node.getAttribute('role') || '').toLowerCase();
+        const ariaModal = (node.getAttribute('aria-modal') || '').toLowerCase();
+        const testId = (node.getAttribute('data-testid') || '').toLowerCase();
+        const className = typeof node.className === 'string' ? node.className.toLowerCase() : '';
+        const computed = window.getComputedStyle(node);
+        const position = computed.position;
+        const zIndex = Number.parseInt(computed.zIndex || '0', 10);
+        const rect = node.getBoundingClientRect();
+        const area = Math.max(0, rect.width) * Math.max(0, rect.height);
+
+        const isFloating = (position === 'fixed' || position === 'sticky') && area >= 1600;
+        const isDialogLike = ariaModal === 'true' || role === 'dialog' || role === 'alertdialog';
+        const isTransientLayer = testId.includes('modal')
+          || testId.includes('sheetdialog')
+          || testId.includes('hovercard')
+          || testId.includes('toast');
+        const isHighZFloating = isFloating && Number.isFinite(zIndex) && zIndex >= 1000;
+        const isFloatingSkeleton = isFloating && (className.includes('skeleton') || className.includes('shimmer') || className.includes('loading'));
+
+        if (isDialogLike || isTransientLayer || isHighZFloating || isFloatingSkeleton) {
+          node.setAttribute(markAttr, '1');
+        }
+      }
+
+      let style = document.getElementById(styleId) as HTMLStyleElement | null;
+      if (!style) {
+        style = document.createElement('style');
+        style.id = styleId;
+        (document.head || document.documentElement).appendChild(style);
+      }
+      style.textContent = cssText;
+    }, TWEET_ARTICLE_SELECTOR, SCREENSHOT_STABILITY_STYLE_ID, SCREENSHOT_OVERLAY_MARK_ATTR, SCREENSHOT_STABILITY_CSS);
+    if (config.outputLogs) {
+      logger.info('[截图流程] 已启用浮层隐藏与动画冻结');
+    }
+  } catch (err) {
+    if (config.outputLogs) {
+      logger.warn('[截图流程] 启用浮层隐藏失败，继续原流程', err);
+    }
+  }
+
+  return async () => {
+    try {
+      await page.evaluate((styleId, markAttr) => {
+        document.getElementById(styleId)?.remove();
+        const marked = Array.from(document.querySelectorAll(`[${markAttr}]`));
+        for (const node of marked) {
+          node.removeAttribute(markAttr);
+        }
+      }, SCREENSHOT_STABILITY_STYLE_ID, SCREENSHOT_OVERLAY_MARK_ATTR);
+    } catch (err) {
+      if (config.outputLogs) {
+        logger.warn('[截图流程] 恢复页面临时样式失败', err);
+      }
+    }
+  };
+}
+
+async function captureTweetScreenshot(page: any, config: Config, scene: string): Promise<Buffer | null> {
+  const element = await page.waitForSelector(TWEET_ARTICLE_SELECTOR, { timeout: 15000 });
+  if (!element) return null;
+  const restoreVisualGuards = await installScreenshotVisualGuards(page, config);
+
+  try {
+    try {
+      await element.evaluate((el) => {
+        el.scrollIntoView({ block: 'center', inline: 'nearest', behavior: 'auto' });
+      });
+    } catch (err) {
+      if (config.outputLogs) {
+        logger.warn(`[截图流程] ${scene} 滚动定位失败，继续尝试截图`, err);
+      }
+    }
+
+    try {
+      await waitForTweetImagesLoaded(page, TWEET_ARTICLE_SELECTOR);
+    } catch (err) {
+      if (config.outputLogs) {
+        logger.info(`[截图流程] ${scene} 图片等待超时，按当前渲染结果继续`);
+      }
+    }
+
+    const stableBox = await waitForStableElementBox(element);
+    await waitBeforeScreenshot(config, scene);
+
+    try {
+      const buf = await element.screenshot({ type: 'webp' });
+      if (config.outputLogs) {
+        logger.info(`[截图流程] ${scene} 使用元素截图成功`, {
+          width: stableBox?.width || 0,
+          height: stableBox?.height || 0,
+        });
+      }
+      return buf;
+    } catch (err) {
+      if (config.outputLogs) {
+        logger.warn(`[截图流程] ${scene} 元素截图失败，回退到 clip 截图`, err);
+      }
+    }
+
+    const viewport = page.viewport?.();
+    const box = stableBox || await element.boundingBox();
+    const clip = clampClipToViewport(box, viewport);
+    if (!clip) return null;
+
+    const fallback = await page.screenshot({
+      clip,
+      type: 'webp',
+      captureBeyondViewport: true,
+    });
+    if (config.outputLogs) {
+      logger.info(`[截图流程] ${scene} 使用 clip 回退截图成功`, clip);
+    }
+    return fallback;
+  } finally {
+    await restoreVisualGuards();
+  }
 }
 
 function isManualTwitterCommandMessage(content: string): boolean {
@@ -1227,89 +1411,18 @@ async function getTimePushedTweet(ctx, pptr, url, config, maxRetries?: number): 
       // 设置超时时间
       await page.setDefaultNavigationTimeout(60000);
       await page.setDefaultTimeout(60000);
+      await applyStableScreenshotViewport(page, config);
       await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 60000 });
       // 等待推文容器渲染
       await page.waitForSelector('article', { timeout: 30000 });
-      // 等待推文内所有图片加载完成
-      await page.evaluate(async () => {
-        const article = document.querySelector('article[data-testid="tweet"]') || document.querySelector('article');
-        if (!article) return;
-        const imgs = Array.from(article.querySelectorAll('img'));
-        await Promise.all(imgs.map(img => {
-          if (img.complete && img.naturalWidth > 0) return Promise.resolve();
-          return new Promise(resolve => {
-            img.onload = img.onerror = resolve;
-          });
-        }));
-      });
       // 检查是否为受保护账号
       const isProtected = await page.evaluate(() => {
         return !!document.querySelector('[aria-label="受保护账号"]');
       });
-
-      // 定位到推文容器进行截图
-      const element = await page.waitForSelector('article[data-testid="tweet"]', { timeout: 15000 });
-      if (!element) {
-        throw new Error('未能找到推文容器');
-      }
-      // Try to wait until images inside the article are complete, then
-      // compute a tight union bbox between the article and a detected avatar image
-      // to avoid expanding too far left (which may include page chrome/sidebar).
-      let screenshotBuffer;
-      try {
-        try {
-          // wait up to 8s for imgs inside the article to finish loading
-          await page.waitForFunction((sel) => {
-            const a = document.querySelector(sel);
-            if (!a) return false;
-            const imgs = Array.from(a.querySelectorAll('img')) as HTMLImageElement[];
-            return imgs.every((img) => img.complete && img.naturalWidth > 0);
-          }, { timeout: 8000 }, 'article[data-testid="tweet"]');
-        } catch (__) {
-          // proceed even if timeout — we'll still try to capture
-        }
-        await waitBeforeScreenshot(config, '公开推文截图');
-        const box = await element.boundingBox();
-        if (box) {
-          // detect a likely avatar inside the article by finding a small image near the top
-          const imgs = await element.$$('img');
-          let avatarBox = null;
-          for (const img of imgs) {
-            try {
-              const ibox = await img.boundingBox();
-              if (!ibox) continue;
-              const relTop = ibox.y - box.y;
-              // small width and near the top of the article -> likely avatar
-              if (ibox.width <= 96 && relTop >= 0 && relTop <= 96) {
-                avatarBox = ibox;
-                break;
-              }
-            } catch (__) {
-            }
-          }
-          // union bbox
-          let leftMost = box.x;
-          let topMost = box.y;
-          let rightMost = box.x + box.width;
-          let bottomMost = box.y + box.height;
-          if (avatarBox) {
-            leftMost = Math.min(leftMost, avatarBox.x);
-            topMost = Math.min(topMost, avatarBox.y);
-            rightMost = Math.max(rightMost, avatarBox.x + avatarBox.width);
-            bottomMost = Math.max(bottomMost, avatarBox.y + avatarBox.height);
-          }
-          const pad = 12;
-          const x = Math.max(0, Math.floor(leftMost - pad));
-          const y = Math.max(0, Math.floor(topMost - pad));
-          const width = Math.ceil(rightMost - leftMost + pad * 2);
-          const height = Math.ceil(bottomMost - topMost + pad * 2);
-          screenshotBuffer = await page.screenshot({ clip: { x, y, width, height }, type: "webp" });
-        } else {
-          screenshotBuffer = await element.screenshot({ type: "webp" });
-        }
-      } catch (e) {
-        // fallback to element screenshot on any error
-        screenshotBuffer = await element.screenshot({ type: "webp" });
+      const screenshotScene = isProtected ? '受保护推文截图' : '公开推文截图';
+      const screenshotBuffer = await captureTweetScreenshot(page, config, screenshotScene);
+      if (!screenshotBuffer) {
+        throw new Error('未能获取推文截图');
       }
 
       if (isProtected) {
@@ -1318,64 +1431,11 @@ async function getTimePushedTweet(ctx, pptr, url, config, maxRetries?: number): 
           const el = document.querySelector('div[data-testid="tweetText"]');
           return el ? el.textContent.trim() : '';
         });
-        const element2 = await page.waitForSelector('article[data-testid="tweet"]', { timeout: 15000 });
-        let screenshotBuffer2 = null;
-        if (element2) {
-          try {
-            try {
-              await page.waitForFunction((sel) => {
-                const a = document.querySelector(sel);
-                if (!a) return false;
-                const imgs = Array.from(a.querySelectorAll('img')) as HTMLImageElement[];
-                return imgs.every((img) => img.complete && img.naturalWidth > 0);
-              }, { timeout: 8000 }, 'article[data-testid="tweet"]');
-            } catch (__) {
-            }
-            await waitBeforeScreenshot(config, '受保护推文截图');
-            const box2 = await element2.boundingBox();
-            if (box2) {
-              const imgs2 = await element2.$$('img');
-              let avatarBox2 = null;
-              for (const img of imgs2) {
-                try {
-                  const ibox = await img.boundingBox();
-                  if (!ibox) continue;
-                  const relTop = ibox.y - box2.y;
-                  if (ibox.width <= 96 && relTop >= 0 && relTop <= 96) {
-                    avatarBox2 = ibox;
-                    break;
-                  }
-                } catch (__) {
-                }
-              }
-              let leftMost2 = box2.x;
-              let topMost2 = box2.y;
-              let rightMost2 = box2.x + box2.width;
-              let bottomMost2 = box2.y + box2.height;
-              if (avatarBox2) {
-                leftMost2 = Math.min(leftMost2, avatarBox2.x);
-                topMost2 = Math.min(topMost2, avatarBox2.y);
-                rightMost2 = Math.max(rightMost2, avatarBox2.x + avatarBox2.width);
-                bottomMost2 = Math.max(bottomMost2, avatarBox2.y + avatarBox2.height);
-              }
-              const pad2 = 12;
-              const x2 = Math.max(0, Math.floor(leftMost2 - pad2));
-              const y2 = Math.max(0, Math.floor(topMost2 - pad2));
-              const width2 = Math.ceil(rightMost2 - leftMost2 + pad2 * 2);
-              const height2 = Math.ceil(bottomMost2 - topMost2 + pad2 * 2);
-              screenshotBuffer2 = await page.screenshot({ clip: { x: x2, y: y2, width: width2, height: height2 }, type: "webp" });
-            } else {
-              screenshotBuffer2 = await element2.screenshot({ type: "webp" });
-            }
-          } catch (err) {
-            screenshotBuffer2 = await element2.screenshot({ type: "webp" });
-          }
-        }
         return {
           word_content: `${word_content}\n（注：此账号为受保护账号，故不提供具体媒体内容）`,
           altTexts: [],
           mediaUrls: [],
-          screenshotBuffer: screenshotBuffer2
+          screenshotBuffer
         };
       } else {
         // 请求 vxtwitter API
